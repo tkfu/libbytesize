@@ -1,8 +1,8 @@
 #include <gmp.h>
-#include <mpfr.h>
 #include <langinfo.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <string.h>
 #include <ctype.h>
@@ -224,11 +224,173 @@ static void strstrip(char *str) {
     str[i-begin] = '\0';
 }
 
-static bool multiply_size_by_unit (mpfr_t size, char *unit_str) {
+/**
+ * parse_decimal_to_rational: (skip)
+ *
+ * Parses a decimal string (possibly with scientific notation) and converts it
+ * to a rational number (mpq_t). Handles localization by accepting the radix
+ * character. This is the equivalent of libgmp's mpf_set_str, but parses the
+ * number as a rational number instead of a floating-point number. It only
+ * handles exponents in base 10, because the original calling site hard-codes
+ * the base to 10.
+ */
+static int parse_decimal_to_rational (mpq_t result, const char *str, const char *radix_char) {
+    char const * const pattern = "^\\s*"
+                                  "(?P<sign>[-+]?)"
+                                  "(?P<int_part>[0-9]*)"
+                                  "(?:%s(?P<frac_part>[0-9]+))?"
+                                  "(?:(?P<exp_sep>[eE])(?P<exp_sign>[-+]?)(?P<exp_val>[0-9]+))?"
+                                  "\\s*$";
+    char *real_pattern = NULL;
+    pcre2_code *regex = NULL;
+    int errorcode = 0;
+    PCRE2_SIZE erroffset;
+    pcre2_match_data *match_data = NULL;
+    PCRE2_UCHAR *substring = NULL;
+    PCRE2_SIZE substring_len = 0;
+    int str_len = 0;
+    int str_count = 0;
+    int status = 0;
+    int sign = 1;
+    long exp_val = 0;
+    int exp_sign = 1;
+    mpz_t numerator, denominator, int_part, frac_part, pow_10;
+    size_t frac_digits = 0;
+
+    if (!str || strlen(str) == 0)
+        return -1;
+
+    /* Build regex pattern with radix character */
+    if (strncmp(radix_char, ".", 1) != 0)
+        real_pattern = strdup_printf(pattern, radix_char);
+    else
+        real_pattern = strdup_printf(pattern, "\\.");
+
+    if (!real_pattern)
+        return -1;
+
+    regex = pcre2_compile((PCRE2_SPTR) real_pattern, PCRE2_ZERO_TERMINATED, PCRE2_EXTENDED, &errorcode, &erroffset, NULL);
+    free(real_pattern);
+    if (!regex)
+        return -1;
+
+    str_len = strlen(str);
+    match_data = pcre2_match_data_create_from_pattern(regex, NULL);
+    str_count = pcre2_match(regex, (PCRE2_SPTR) str, str_len, 0, 0, match_data, NULL);
+
+    if (str_count < 0) {
+        pcre2_match_data_free(match_data);
+        pcre2_code_free(regex);
+        return -1;
+    }
+
+    mpz_init(numerator);
+    mpz_init(denominator);
+    mpz_init(int_part);
+    mpz_init(frac_part);
+    mpz_init(pow_10);
+
+    /* Extract sign */
+    status = pcre2_substring_get_byname(match_data, (PCRE2_SPTR) "sign", &substring, &substring_len);
+    if (status >= 0 && substring_len > 0 && substring[0] == '-')
+        sign = -1;
+    if (status >= 0)
+        pcre2_substring_free(substring);
+
+    /* Extract integer part */
+    status = pcre2_substring_get_byname(match_data, (PCRE2_SPTR) "int_part", &substring, &substring_len);
+    if (status >= 0 && substring_len > 0) {
+        status = mpz_set_str(int_part, (const char *) substring, 10);
+        pcre2_substring_free(substring);
+        if (status != 0) {
+            mpz_clears(numerator, denominator, int_part, frac_part, pow_10, NULL);
+            pcre2_match_data_free(match_data);
+            pcre2_code_free(regex);
+            return -1;
+        }
+    } else {
+        mpz_set_ui(int_part, 0);
+        if (status >= 0)
+            pcre2_substring_free(substring);
+    }
+
+    /* Extract fractional part */
+    status = pcre2_substring_get_byname(match_data, (PCRE2_SPTR) "frac_part", &substring, &substring_len);
+    if (status >= 0 && substring_len > 0) {
+        frac_digits = substring_len;
+        status = mpz_set_str(frac_part, (const char *) substring, 10);
+        pcre2_substring_free(substring);
+        if (status != 0) {
+            mpz_clears(numerator, denominator, int_part, frac_part, pow_10, NULL);
+            pcre2_match_data_free(match_data);
+            pcre2_code_free(regex);
+            return -1;
+        }
+    } else {
+        mpz_set_ui(frac_part, 0);
+        frac_digits = 0;
+        if (status >= 0)
+            pcre2_substring_free(substring);
+    }
+
+    /* Extract exponent */
+    status = pcre2_substring_get_byname(match_data, (PCRE2_SPTR) "exp_val", &substring, &substring_len);
+    if (status >= 0 && substring_len > 0) {
+        exp_val = strtol((const char *) substring, NULL, 10);
+        pcre2_substring_free(substring);
+
+        status = pcre2_substring_get_byname(match_data, (PCRE2_SPTR) "exp_sign", &substring, &substring_len);
+        if (status >= 0 && substring_len > 0 && substring[0] == '-')
+            exp_sign = -1;
+        if (status >= 0)
+            pcre2_substring_free(substring);
+    }
+
+    /* Compute denominator = 10^frac_digits */
+    mpz_ui_pow_ui(pow_10, 10, frac_digits);
+    mpz_set(denominator, pow_10);
+
+    /* Compute numerator = int_part * 10^frac_digits + frac_part */
+    mpz_mul(numerator, int_part, pow_10);
+    mpz_add(numerator, numerator, frac_part);
+
+    /* Apply exponent: multiply or divide by 10^exp_val */
+    if (exp_val != 0) {
+        long adjusted_exp = exp_val;
+        if (exp_sign == -1)
+            adjusted_exp = -adjusted_exp;
+
+        if (adjusted_exp > 0) {
+            mpz_ui_pow_ui(pow_10, 10, adjusted_exp);
+            mpz_mul(numerator, numerator, pow_10);
+        } else if (adjusted_exp < 0) {
+            mpz_ui_pow_ui(pow_10, 10, -adjusted_exp);
+            mpz_mul(denominator, denominator, pow_10);
+        }
+    }
+
+    /* Apply sign */
+    if (sign == -1)
+        mpz_neg(numerator, numerator);
+
+    /* Set the rational number */
+    mpq_set_num(result, numerator);
+    mpq_set_den(result, denominator);
+    mpq_canonicalize(result);
+
+    mpz_clears(numerator, denominator, int_part, frac_part, pow_10, NULL);
+    pcre2_match_data_free(match_data);
+    pcre2_code_free(regex);
+
+    return 0;
+}
+
+static bool multiply_size_by_unit (mpq_t size, char *unit_str) {
     BSBunit bunit = BS_BUNIT_UNDEF;
     BSDunit dunit = BS_DUNIT_UNDEF;
     uint64_t pwr = 0;
-    mpfr_t dec_mul;
+    mpq_t dec_mul;
+    mpz_t pow_1000;
     size_t unit_str_len = 0;
 
     unit_str_len = strlen (unit_str);
@@ -236,18 +398,22 @@ static bool multiply_size_by_unit (mpfr_t size, char *unit_str) {
     for (bunit=BS_BUNIT_B; bunit < BS_BUNIT_UNDEF; bunit++)
         if (strncasecmp (unit_str, b_units[bunit-BS_BUNIT_B], unit_str_len) == 0) {
             pwr = (uint64_t) bunit - BS_BUNIT_B;
-            mpfr_mul_2exp (size, size, 10 * pwr, MPFR_RNDN);
+            /* Multiply by 2^(10*pwr) by shifting numerator left */
+            mpz_mul_2exp (mpq_numref (size), mpq_numref (size), 10 * pwr);
             return true;
         }
 
-    mpfr_init2 (dec_mul, BS_FLOAT_PREC_BITS);
-    mpfr_set_ui (dec_mul, 1000, MPFR_RNDN);
+    mpq_init (dec_mul);
+    mpz_init (pow_1000);
     for (dunit=BS_DUNIT_B; dunit < BS_DUNIT_UNDEF; dunit++)
         if (strncasecmp (unit_str, d_units[dunit-BS_DUNIT_B], unit_str_len) == 0) {
             pwr = (uint64_t) (dunit - BS_DUNIT_B);
-            mpfr_pow_ui (dec_mul, dec_mul, pwr, MPFR_RNDN);
-            mpfr_mul (size, size, dec_mul, MPFR_RNDN);
-            mpfr_clear (dec_mul);
+            /* Compute 1000^pwr exactly as a rational number */
+            mpz_ui_pow_ui (pow_1000, 1000, pwr);
+            mpq_set_z (dec_mul, pow_1000);
+            mpq_mul (size, size, dec_mul);
+            mpz_clear (pow_1000);
+            mpq_clear (dec_mul);
             return true;
         }
 
@@ -256,21 +422,27 @@ static bool multiply_size_by_unit (mpfr_t size, char *unit_str) {
     for (bunit=BS_BUNIT_B; bunit < BS_BUNIT_UNDEF; bunit++)
         if (strncasecmp (unit_str, _(b_units[bunit-BS_BUNIT_B]), unit_str_len) == 0) {
             pwr = (uint64_t) bunit - BS_BUNIT_B;
-            mpfr_mul_2exp (size, size, 10 * pwr, MPFR_RNDN);
+            /* Multiply by 2^(10*pwr) by shifting numerator left */
+            mpz_mul_2exp (mpq_numref (size), mpq_numref (size), 10 * pwr);
+            mpz_clear (pow_1000);
+            mpq_clear (dec_mul);
             return true;
         }
 
-    mpfr_init2 (dec_mul, BS_FLOAT_PREC_BITS);
-    mpfr_set_ui (dec_mul, 1000, MPFR_RNDN);
     for (dunit=BS_DUNIT_B; dunit < BS_DUNIT_UNDEF; dunit++)
         if (strncasecmp (unit_str, _(d_units[dunit-BS_DUNIT_B]), unit_str_len) == 0) {
             pwr = (uint64_t) (dunit - BS_DUNIT_B);
-            mpfr_pow_ui (dec_mul, dec_mul, pwr, MPFR_RNDN);
-            mpfr_mul (size, size, dec_mul, MPFR_RNDN);
-            mpfr_clear (dec_mul);
+            /* Compute 1000^pwr exactly as a rational number */
+            mpz_ui_pow_ui (pow_1000, 1000, pwr);
+            mpq_set_z (dec_mul, pow_1000);
+            mpq_mul (size, size, dec_mul);
+            mpz_clear (pow_1000);
+            mpq_clear (dec_mul);
             return true;
         }
 
+    mpz_clear (pow_1000);
+    mpq_clear (dec_mul);
     return false;
 }
 
@@ -451,8 +623,7 @@ BSSize bs_size_new_from_str (const char *size_str, BSError **error) {
     int str_count = 0;
     const char *radix_char = NULL;
     char *loc_size_str = NULL;
-    mpf_t parsed_size;
-    mpfr_t size;
+    mpq_t size;
     int status = 0;
     BSSize ret = NULL;
     PCRE2_UCHAR *substring = NULL;
@@ -518,23 +689,18 @@ BSSize bs_size_new_from_str (const char *size_str, BSError **error) {
         return NULL;
     }
 
-    /* parse the number using GMP because it knows how to handle localization
-       much better than MPFR */
-    mpf_init2 (parsed_size, BS_FLOAT_PREC_BITS);
-    status = mpf_set_str (parsed_size, *substring == '+' ? (const char *) substring+1 : (const char *) substring, 10);
+    /* Parse the number as a rational to avoid floating-point precision issues */
+    mpq_init (size);
+    status = parse_decimal_to_rational (size, *substring == '+' ? (const char *) substring+1 : (const char *) substring, radix_char);
     pcre2_substring_free (substring);
     if (status != 0) {
         set_error (error, BS_ERROR_INVALID_SPEC, strdup_printf ("Failed to parse size spec: %s", size_str));
         pcre2_match_data_free (match_data);
         pcre2_code_free (regex);
         free (loc_size_str);
-        mpf_clear (parsed_size);
+        mpq_clear (size);
         return NULL;
     }
-    /* but use MPFR from now on because GMP thinks 0.1*1000 = 99 */
-    mpfr_init2 (size, BS_FLOAT_PREC_BITS);
-    mpfr_set_f (size, parsed_size, MPFR_RNDN);
-    mpf_clear (parsed_size);
 
     status = pcre2_substring_get_byname (match_data, (PCRE2_SPTR) "rest", &substring, &substring_len);
     if ((status >= 0) && strncmp ((const char *) substring, "", 1) != 0) {
@@ -545,7 +711,7 @@ BSSize bs_size_new_from_str (const char *size_str, BSError **error) {
             pcre2_match_data_free (match_data);
             pcre2_code_free (regex);
             free (loc_size_str);
-            mpfr_clear (size);
+            mpq_clear (size);
             return NULL;
         }
     }
@@ -554,10 +720,11 @@ BSSize bs_size_new_from_str (const char *size_str, BSError **error) {
     pcre2_code_free (regex);
 
     ret = bs_size_new ();
-    mpfr_get_z (ret->bytes, size, MPFR_RNDZ);
+    /* Convert rational to integer by dividing numerator by denominator (rounding toward zero) */
+    mpz_tdiv_q (ret->bytes, mpq_numref (size), mpq_denref (size));
 
     free (loc_size_str);
-    mpfr_clear (size);
+    mpq_clear (size);
 
     return ret;
 }
